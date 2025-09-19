@@ -46,14 +46,13 @@
 /// Files not used by the parser vor version < 2.0.7:
 /// ATTRIBUT_DE, ATTRIBUT_EN, ATTRIBUT_FR, ATTRIBUT_IT
 /// These files were suppressed in 2.0.7
-use std::{cell::RefCell, error::Error, rc::Rc, str::FromStr};
+use std::{error::Error, str::FromStr};
 
 use nom::{
-    IResult, Parser,
+    Parser,
     branch::alt,
     bytes::{tag, take_until},
     character::{char, complete::multispace1},
-    combinator::{map, map_res},
     sequence::{preceded, terminated},
 };
 use rustc_hash::FxHashMap;
@@ -228,23 +227,31 @@ mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
     use crate::parsing::tests::get_json_values;
-    use nom::IResult;
     use pretty_assertions::assert_eq;
 
-    fn row_language_description_parser(input: &str) -> IResult<&str, (String, String)> {
-        let (res, (id, _, description)) = row_language_description_combinator().parse(input)?;
-        Ok((res, (id, description)))
+    fn row_language_description_parser(input: &str) -> Result<(String, String), Box<dyn Error>> {
+        let (_, ld) = row_language_description_combinator()
+            .parse(input)
+            .map_err(|e| format!("Error {e}: Unable to parse {input}"))?;
+
+        match ld {
+            AttributeRow::LanguageDescription {
+                legacy_id,
+                description,
+            } => Ok((legacy_id, description)),
+            _ => Err("Not a LanguageDescription".into()),
+        }
     }
 
     #[test]
     fn language_description_row() {
         let input = "VR VELOS: Reservation obligatory";
-        let (_, (id, description)) = row_language_description_parser(input).unwrap();
+        let (id, description) = row_language_description_parser(input).unwrap();
         assert_eq!("VR", id);
         assert_eq!("VELOS: Reservation obligatory", description);
 
         let input = "2  2nd class only";
-        let (_, (id, description)) = row_language_description_parser(input).unwrap();
+        let (id, description) = row_language_description_parser(input).unwrap();
         assert_eq!("2", id);
         assert_eq!("2nd class only", description);
     }
@@ -252,57 +259,83 @@ mod tests {
     #[test]
     fn language_description_long_row() {
         let input = "VR  VELOS: Reservation obligatory";
-        let (_, (id, description)) = row_language_description_parser(input).unwrap();
+        let (id, description) = row_language_description_parser(input).unwrap();
         assert_eq!("VR", id);
         assert_eq!("VELOS: Reservation obligatory", description);
 
         let input = "2   2nd class only";
-        let (_, (id, description)) = row_language_description_parser(input).unwrap();
+        let (id, description) = row_language_description_parser(input).unwrap();
         assert_eq!("2", id);
         assert_eq!("2nd class only", description);
     }
 
-    fn row_description_parser(input: &str) -> IResult<&str, String> {
-        let (res, description) = row_description_combinator().parse(input)?;
-        Ok((res, description))
+    fn row_description_parser(input: &str) -> Result<String, Box<dyn Error>> {
+        let (_, lang) = row_description_combinator()
+            .parse(input)
+            .map_err(|e| format!("Error {e}: Unable to parse {input}"))?;
+
+        match lang {
+            AttributeRow::Description(s) => Ok(s),
+            _ => Err("Not a Description".into()),
+        }
     }
 
     #[test]
     fn description_row() {
         let input = "# WR WR WR";
-        let (_, description) = row_description_parser(input).unwrap();
+        let description = row_description_parser(input).unwrap();
         assert_eq!("WR WR WR", description);
     }
 
-    fn row_offer_parser(input: &str) -> IResult<&str, (String, i16, i16, i16)> {
-        let (res, (id, _, journey_section, _, priority, _, sorting)) =
-            row_offer_combinator().parse(input).unwrap();
-        Ok((res, (id, journey_section, priority, sorting)))
+    fn row_offer_parser(input: &str) -> Result<(String, i16, i16, i16), Box<dyn Error>> {
+        let (_, line) = row_offer_combinator()
+            .parse(input)
+            .map_err(|e| format!("Error {e}: Unable to parse {input}"))?;
+        match line {
+            AttributeRow::Offer {
+                designation_id,
+                stop_scope,
+                priority,
+                secondary_sorting_priority,
+            } => Ok((
+                designation_id,
+                stop_scope,
+                priority,
+                secondary_sorting_priority,
+            )),
+            _ => Err("Not an Offer".into()),
+        }
     }
 
     #[test]
     fn offer_row() {
         let input = "PR 0   4  5";
-        let (_, (id, journey_section, priority, sorting)) = row_offer_parser(input).unwrap();
+        let (id, journey_section, priority, sorting) = row_offer_parser(input).unwrap();
         assert_eq!("PR", id);
         assert_eq!(0, journey_section);
         assert_eq!(4, priority);
         assert_eq!(5, sorting);
     }
 
-    fn row_language_parser(input: &str) -> IResult<&str, String> {
-        let (res, language) = row_language_combinator().parse(input).unwrap();
-        Ok((res, language))
+    fn row_language_parser(input: &str) -> Result<String, Box<dyn Error>> {
+        let (_, line) = row_language_combinator()
+            .parse(input)
+            .map_err(|e| format!("Error {e}: Unable to parse {input}"))?;
+
+        match line {
+            AttributeRow::Language(language) => Ok(language),
+            _ => Err("Not a Language".into()),
+        }
     }
 
     #[test]
     fn language_row() {
         let input = "<text>";
-        let (_, language) = row_language_parser(input).unwrap();
+        let language = row_language_parser(input).unwrap();
         assert_eq!("text", language);
 
         let input = "<fre>";
-        let (_, language) = row_language_parser(input).unwrap();
+        let language = row_language_parser(input).unwrap();
         assert_eq!("fre", language);
     }
 
@@ -322,31 +355,23 @@ mod tests {
         ];
 
         let auto_increment = AutoIncrement::new();
-        let data = Rc::new(RefCell::new(FxHashMap::default()));
-        let pk_type_converter = Rc::new(RefCell::new(FxHashMap::default()));
-        let current_language = Rc::new(RefCell::new(Language::default()));
+        let mut data = FxHashMap::default();
+        let mut pk_type_converter = FxHashMap::default();
+        let mut current_language = Language::default();
 
         rows.into_iter()
             .filter(|line| !line.trim().is_empty())
             .try_for_each(|line| {
                 parse_line(
                     &line,
-                    data.clone(),
-                    pk_type_converter.clone(),
+                    &mut data,
+                    &mut pk_type_converter,
                     &auto_increment,
-                    Rc::clone(&current_language),
+                    &mut current_language,
                 )
             })
             .unwrap();
 
-        let data = RefCell::<FxHashMap<i32, Attribute>>::into_inner(
-            Rc::into_inner(data).ok_or("Unable to get data").unwrap(),
-        );
-        let pk_type_converter = RefCell::<FxHashMap<String, i32>>::into_inner(
-            Rc::into_inner(pk_type_converter)
-                .ok_or("Unable to get pk_type_converter")
-                .unwrap(),
-        );
         assert_eq!(*pk_type_converter.get("GK").unwrap(), 1);
         let attribute = data.get(&1).unwrap();
         let reference = r#"
