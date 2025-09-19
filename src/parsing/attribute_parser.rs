@@ -141,9 +141,9 @@ fn parse_line(
     current_language: &mut Language,
 ) -> Result<(), Box<dyn Error>> {
     let (_, attribute_row) = alt((
+        row_offer_combinator(),
         row_language_combinator(),
         row_language_description_combinator(),
-        row_offer_combinator(),
         row_description_combinator(),
     ))
     .parse(line)
@@ -163,7 +163,6 @@ fn parse_line(
                     "Error: previous id {previous} for {designation_id}. The designation, {designation_id}, is not unique."
                 );
             }
-
             let attribute = Attribute::new(
                 id,
                 designation_id.to_owned(),
