@@ -49,7 +49,7 @@
 use std::{cell::RefCell, error::Error, rc::Rc, str::FromStr};
 
 use nom::{
-    Parser,
+    IResult, Parser,
     branch::alt,
     bytes::{tag, take_until},
     character::{char, complete::multispace1},
@@ -69,11 +69,23 @@ use crate::{
 
 type AttributeAndTypeConverter = (ResourceStorage<Attribute>, FxHashMap<String, i32>);
 
-fn row_offer_combinator<'a>() -> impl Parser<
-    &'a str,
-    Output = (String, char, i16, char, i16, char, i16),
-    Error = nom::error::Error<&'a str>,
-> {
+enum AttributeRow {
+    Offer {
+        designation_id: String,
+        stop_scope: i16,
+        priority: i16,
+        secondary_sorting_priority: i16,
+    },
+    Language(String),
+    LanguageDescription {
+        legacy_id: String,
+        description: String,
+    },
+    Description(String),
+}
+
+fn row_offer_combinator<'a>()
+-> impl Parser<&'a str, Output = AttributeRow, Error = nom::error::Error<&'a str>> {
     (
         string_from_n_chars_parser(2),
         char(' '),
@@ -83,104 +95,107 @@ fn row_offer_combinator<'a>() -> impl Parser<
         char(' '),
         i16_from_n_digits_parser(2),
     )
+        .map(
+            |(designation_id, _, stop_scope, _, priority, _, secondary_sorting_priority)| {
+                AttributeRow::Offer {
+                    designation_id,
+                    stop_scope,
+                    priority,
+                    secondary_sorting_priority,
+                }
+            },
+        )
 }
 
 fn row_language_combinator<'a>()
--> impl Parser<&'a str, Output = String, Error = nom::error::Error<&'a str>> {
-    map(
-        preceded(tag("<"), terminated(take_until(">"), tag(">"))),
-        String::from,
-    )
+-> impl Parser<&'a str, Output = AttributeRow, Error = nom::error::Error<&'a str>> {
+    preceded(tag("<"), terminated(take_until(">"), tag(">")))
+        .map(|s| AttributeRow::Language(String::from(s)))
 }
 
 fn row_description_combinator<'a>()
--> impl Parser<&'a str, Output = String, Error = nom::error::Error<&'a str>> {
-    preceded(tag("#"), string_till_eol_parser())
+-> impl Parser<&'a str, Output = AttributeRow, Error = nom::error::Error<&'a str>> {
+    preceded(tag("#"), string_till_eol_parser()).map(AttributeRow::Description)
 }
 
 fn row_language_description_combinator<'a>()
--> impl Parser<&'a str, Output = (String, &'a str, String), Error = nom::error::Error<&'a str>> {
+-> impl Parser<&'a str, Output = AttributeRow, Error = nom::error::Error<&'a str>> {
     (
         string_from_n_chars_parser(2),
         multispace1,
         string_till_eol_parser(),
     )
+        .map(
+            |(legacy_id, _, description)| AttributeRow::LanguageDescription {
+                legacy_id,
+                description,
+            },
+        )
 }
 
 fn parse_line(
     line: &str,
-    data: Rc<RefCell<FxHashMap<i32, Attribute>>>,
-    pk_type_converter: Rc<RefCell<FxHashMap<String, i32>>>,
+    data: &mut FxHashMap<i32, Attribute>,
+    pk_type_converter: &mut FxHashMap<String, i32>,
     auto_increment: &AutoIncrement,
-    current_language: Rc<RefCell<Language>>,
+    current_language: &mut Language,
 ) -> Result<(), Box<dyn Error>> {
-    let _ = alt((
-        map_res(
-            row_language_combinator(),
-            |language| {
-                if language != "text" {
-                    log::info!("changing language to: {language}");
-                    *current_language.borrow_mut() = Language::from_str(&language)?;
-                    log::info!("current_language = {}", *current_language.borrow());
-                }
-                Ok::<(), Box<dyn Error>>(())
-            },
-        ),
-        map_res(
-            row_offer_combinator(),
-            |(designation, _, stop_scope, _, priority, _, secondary_sorting_priority)| {
-                let local_data = Rc::clone(&data);
-                let id = auto_increment.next();
-
-                if let Some(previous) = pk_type_converter.borrow_mut().insert(designation.to_owned(), id) {
-                    log::error!(
-                        "Error: previous id {previous} for {designation}. The designation, {designation}, is not unique."
-                    );
-                }
-
-                let attribute = Attribute::new(
-                    id,
-                    designation.to_owned(),
-                    stop_scope,
-                    priority,
-                    secondary_sorting_priority,
-                );
-                local_data
-                    .borrow_mut()
-                .insert(attribute.id(), attribute);
-
-                Ok::<(), Box<dyn Error>>(())
-            },
-        ),
-        map_res(
-            row_description_combinator(),
-            |_description| {
-                // We do nothing the # starting row is ignord for now
-                // TODO: Update maybe
-                Ok::<(), Box<dyn Error>>(())
-            },
-        ),
-        map_res(
-            row_language_description_combinator(),
-            |(legacy_id, _, description)| {
-                let local_pk = pk_type_converter.borrow();
-                let id = local_pk
-                    .get(&legacy_id)
-                    .ok_or("Unknown legacy ID")?;
-
-                log::info!("{}", *current_language.borrow());
-
-                data.borrow_mut().get_mut(id)
-                    .ok_or("Unknown ID")?
-                    .set_description(*current_language.borrow(), &description);
-
-                Ok::<(), Box<dyn Error>>(())
-            },
-        ),
+    let (_, attribute_row) = alt((
+        row_language_combinator(),
+        row_language_description_combinator(),
+        row_offer_combinator(),
+        row_description_combinator(),
     ))
     .parse(line)
-    .map_err(|e| format!("Failed to parse line '{}': {}", line, e))?;
-    Ok::<(), Box<dyn Error>>(())
+    .map_err(|e| format!("Error {e} while parsing {line}"))?;
+
+    match attribute_row {
+        AttributeRow::Offer {
+            designation_id,
+            stop_scope,
+            priority,
+            secondary_sorting_priority,
+        } => {
+            let id = auto_increment.next();
+
+            if let Some(previous) = pk_type_converter.insert(designation_id.to_owned(), id) {
+                log::error!(
+                    "Error: previous id {previous} for {designation_id}. The designation, {designation_id}, is not unique."
+                );
+            }
+
+            let attribute = Attribute::new(
+                id,
+                designation_id.to_owned(),
+                stop_scope,
+                priority,
+                secondary_sorting_priority,
+            );
+            data.insert(attribute.id(), attribute);
+        }
+        AttributeRow::Language(s) => {
+            if s != "text" {
+                *current_language = Language::from_str(&s)?;
+            }
+        }
+        AttributeRow::LanguageDescription {
+            legacy_id,
+            description,
+        } => {
+            let id = pk_type_converter
+                .get(&legacy_id)
+                .ok_or(format!("Unknown legacy ID: {legacy_id}"))?;
+
+            data.get_mut(id)
+                .ok_or(format!("Unknown ID: {id}"))?
+                .set_description(*current_language, &description);
+        }
+        AttributeRow::Description(_s) => {
+            // We do nothing
+        }
+    }
+
+    Ok(())
 }
 
 pub fn parse(path: &str) -> Result<AttributeAndTypeConverter, Box<dyn Error>> {
@@ -189,9 +204,9 @@ pub fn parse(path: &str) -> Result<AttributeAndTypeConverter, Box<dyn Error>> {
     let lines = read_lines(&format!("{path}/ATTRIBUT"), 0)?;
 
     let auto_increment = AutoIncrement::new();
-    let data = Rc::new(RefCell::new(FxHashMap::default()));
-    let pk_type_converter = Rc::new(RefCell::new(FxHashMap::default()));
-    let current_language = Rc::new(RefCell::new(Language::default()));
+    let mut data = FxHashMap::default();
+    let mut pk_type_converter = FxHashMap::default();
+    let mut current_language = Language::default();
 
     lines
         .into_iter()
@@ -199,19 +214,12 @@ pub fn parse(path: &str) -> Result<AttributeAndTypeConverter, Box<dyn Error>> {
         .try_for_each(|line| {
             parse_line(
                 &line,
-                data.clone(),
-                pk_type_converter.clone(),
+                &mut data,
+                &mut pk_type_converter,
                 &auto_increment,
-                Rc::clone(&current_language),
+                &mut current_language,
             )
         })?;
-
-    let data = RefCell::<FxHashMap<i32, Attribute>>::into_inner(
-        Rc::into_inner(data).ok_or("Unable to get data")?,
-    );
-    let pk_type_converter = RefCell::<FxHashMap<String, i32>>::into_inner(
-        Rc::into_inner(pk_type_converter).ok_or("Unable to get pk_type_converter")?,
-    );
 
     Ok((ResourceStorage::new(data), pk_type_converter))
 }
